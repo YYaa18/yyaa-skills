@@ -200,7 +200,7 @@ async def gemini_talk(
         # 只清除对话历史，保留模式配置
         session_context.clear(keep_keys=["gemini-talk:locked_mode"])
     
-    # 1. 模式路由 + 锁定（改进：懒校验，读取已有锁定）
+    # 1. 模式路由 + 锁定（改进：懒校验，适配 Gemini 最新 UI）
     if force_mode:
         mode = force_mode
     else:
@@ -214,7 +214,8 @@ async def gemini_talk(
     if is_new_topic:
         await click("发起新对话")
         await wait_for_new_chat()
-        # ✅ 改进：新开对话后懒校验，只在模式不一致时才切换
+        # ✅ 关键修正：Gemini 最新 UI 中，新开对话一定会重置为快速模式
+        # 所以必须在这里重新检测并切换
         current_mode_in_page = get_current_mode_from_page()
         if current_mode_in_page != mode:
             await select_mode(mode)
@@ -249,6 +250,19 @@ async def gemini_talk(
 ## 模式选择实现
 
 ```python
+def get_current_mode_from_page() -> str:
+    """正确判断当前模式（Gemini UI 反直觉设计）
+    Gemini UI 设计：左上角按钮文字 = "你可以点击我切换到这个模式"
+    → 如果按钮显示 "PRO"，说明当前不是 PRO，点击才会切换
+    → 如果按钮显示 "快速"，说明当前已经是 PRO
+    """
+    if page_has_button("快速"):
+        return "pro"
+    elif page_has_button("思考"):
+        return "think"
+    else:  # 显示 "PRO"
+        return "fast"
+
 async def select_mode(mode: str):
     """点击模式选择器，然后选对应模式"""
     await click("打开模式选择器")      # ref=1_23
