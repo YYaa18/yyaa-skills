@@ -1,13 +1,13 @@
-# gemini-talk — 与 Google Gemini 网页版对话
+# gemini-talk —— 与 Google Gemini 网页版对话
 
-> 通过 OpenClaw browser 工具直接控制你的 Chrome Tab，智能选择模式和工具。
+> 通过 OpenClaw browser 工具直接控制你的 Chrome Tab，智能选择模式和工具，自动沉淀知识到本地知识库。
 
 ## 核心设计：智能路由
 
 收到用户请求后，三步决策：
 
 ```
-1. 选择模式（Model） → 2. 选择工具（Tool，可选） → 3. 发送消息
+1. 判断复用/新开 → 2. 选择模式（Model） → 3. 选择工具（Tool，可选） → 4. 发送消息
 ```
 
 ---
@@ -57,6 +57,113 @@
 
 ---
 
+### 会话复用策略（Session-Aware 设计，Gemini Pro 优化版）
+
+采用**多维度判定**代替单纯语义相似度，更鲁棒：
+
+| 判定优先级 | 规则 | 动作 |
+|-------------|------|------|
+| 1. 时效优先 | 距离上次提问 > 30 分钟 (TTL) | → 直接新开 |
+| 2. 指令优先 | 命中 `["换话题", "新对话", "清除上下文", "新开"]` | → 直接新开 |
+| 3. LLM 意图判定 | 不满足以上规则 → 构造简短 Prompt 让 Gemini Flash 判定：<br>`"上文话题[{X}]，当前输入[{Y}]，是否同一话题或连续追问？输出 True/False"` | → True 复用 / False 新开 |
+
+**优势：**
+- 解决了单纯语义相似度问题："那这个呢" 字面相似度低但实际是连续追问不会误判
+- 时间窗口和硬指令优先，减少误判
+- LLM 做最终仲裁，准确率更高
+
+### 对话历史沉淀：知识抽取与存储（Gemini Pro 优化版）
+
+当会话结束（触发新开或超时），自动执行**异步 LLM 驱动结构化抽取 + 双库联动**：
+
+```
+1. 预读取 DOM → 在刷新前获取完整历史（避免刷新后内容丢失）
+2. 清洗 → 过滤语气词、礼貌用语
+3. LLM 抽取 → Gemini 自己抽取 JSON 格式三元组
+4. 存储 → Chroma 向量 + SQLite 三元组，双向索引
+   - Chroma (向量): 存对话 chunk，用于语义检索 RAG
+   - SQLite (三元组): 存 (Subject, Predicate, Object)，用于逻辑推理
+   - 双向索引: Chroma metadata 存 sqlite_row_id，SQLite 存 vector_id
+```
+
+### 存储实现代码
+
+- `libs/knowledge_extractor.py` → 完整实现，支持 LLM 抽取 + 双向索引
+- 数据目录: `~/.openclaw/skills/gemini-talk/data/`
+  - `chroma/` → Chroma 向量存储
+  - `knowledge_triples.db` → SQLite 三元组
+
+#### 使用示例
+
+```python
+from libs.knowledge_extractor import KnowledgeBase, async_extract_to_knowledge_base
+
+# 获取 LLM 抽取结果（调用 Gemini 得到 JSON）
+llm_extract_result = call_gemini_for_extraction(dialog_text)
+
+# 抽取并存入知识库
+result = async_extract_to_knowledge_base(dialog_history, session_id, llm_extract_result)
+
+# 向量检索 + 关联三元组
+kb = KnowledgeBase()
+results = kb.search_with_triples("gemini-talk pro模式 问题", top_k=3)
+
+# 查询三元组
+triples = kb.query_triples(subject="gemini-talk", predicate="preference")
+```
+
+---
+
+## GitHub 代码库导入
+
+### 工作流程
+
+```
+1. 点击上传菜单 → "导入代码" menuitem
+2. 等待"导入代码"对话框出现
+3. 在 textbox 中输入 GitHub URL
+4. 点击"导入"按钮
+5. 等待仓库链接出现（表示导入成功）
+6. 在同一输入框中输入分析请求
+7. 点击发送
+```
+
+### 关键 refs（从 snapshot 获取）
+- `上传菜单 → 导入代码(menuitem)` → 触发对话框
+- `textbox "GitHub 代码库或分支网址"` → 对话框内输入 ref
+- `button "导入"` → 按钮
+
+### 支持的文件上传方式对比
+
+| 方式 | 可用 | 说明 |
+|------|------|------|
+| **GitHub URL 导入** | ✅ | 最可靠，直接分析仓库代码 |
+| **上传文件夹** | ❌ | OS 原生对话框，Playwright 无法控制 |
+| **上传文件** | ❌ | OS 原生对话框，Playwright 无法控制 |
+| **粘贴内容到 textarea** | ✅ | 读取本地文件 → paste 到输入框 |
+| **Google Drive** | 未测试 | 需要 Google 账号授权 |
+
+### 注意
+- 导入代码后，仓库文件会作为上下文附加到对话中
+- 可以连续发送多条消息，仓库上下文保持有效
+- 导入成功后可见 `link "GitHub 图标 xxx GitHub"` 元素
+
+---
+
+### 设计改进：模式状态锁定
+
+针对"发起新对话重置模式"问题，采用了**先选模式，再开新对话 + 懒校验**设计：
+
+```
+1. 路由判断 → 锁定模式到 session_context
+2. 发起新对话 → 清理历史，保留模式配置
+3. 新开对话后懒校验：读取当前页面模式 → 只在不一致时重新选择
+```
+
+这样无论开多少次新对话，Pro/think 模式选择都不会丢失，且减少一次 UI 操作降低失败概率。
+
+---
+
 ## 完整执行函数
 
 ```python
@@ -78,26 +185,64 @@ async def gemini_talk(
         question = extract_question_after_url(message)
         return await import_github_and_analyze(url, question)
 
-    # 1. 模式路由（默认 think）
-    mode = force_mode or route_mode(message)
-
-    # 2. 工具路由（默认无工具）
+    # 0. 判断是否复用当前会话（Session-Aware）
+    last_session = session_context.get("gemini-talk:current_session", None)
+    is_new_topic = intent_router.check_topic_change(
+        current_message=message,
+        last_context=last_session.history if last_session else None
+    )
+    
+    # 如果需要新开，先抽取旧会话知识到知识库
+    if is_new_topic and last_session:
+        # 在发起新对话前读取 DOM 历史，避免刷新后丢失
+        full_history = get_current_history_from_dom()
+        async_extract_to_knowledge_base(full_history, llm_extract=True)
+        # 只清除对话历史，保留模式配置
+        session_context.clear(keep_keys=["gemini-talk:locked_mode"])
+    
+    # 1. 模式路由 + 锁定（改进：懒校验，读取已有锁定）
+    if force_mode:
+        mode = force_mode
+    else:
+        # 优先从 session 读取已有锁定
+        mode = session_context.get("gemini-talk:locked_mode")
+        if not mode:
+            mode = route_mode(message)
+    session_context.set("gemini-talk:locked_mode", mode)
+    
+    # 2. 如果判定为新主题，发起新对话
+    if is_new_topic:
+        await click("发起新对话")
+        await wait_for_new_chat()
+        # ✅ 改进：新开对话后懒校验，只在模式不一致时才切换
+        current_mode_in_page = get_current_mode_from_page()
+        if current_mode_in_page != mode:
+            await select_mode(mode)
+    
+    # 3. 工具路由（默认无工具）
     tool = force_tool or route_tool(message)
-
-    # 3. 选择模式
-    if mode != "fast":  # fast 是默认，无需选择
-        await select_mode(mode)
 
     # 4. 选择工具（如果需要）
     if tool:
         await select_tool(tool)
 
     # 5. 发送消息
-    await send_message(message)
+    response = await send_message(message)
 
-    # 6. 读取回复
+    # 6. 保存当前会话到上下文
+    session_context.set("gemini-talk:current_session", {
+        "history": get_current_history(),
+        "last_message_time": get_current_timestamp()
+    })
+
+    # 7. 读取回复
     return await read_response()
 ```
+
+### 改进亮点（来自 Gemini Pro review）
+1. **减少 UI 操作冗余**：新开对话后只在模式不一致时才切换，降低 Flaky 概率
+2. **懒校验模式**：优先复用 session_context 中已锁定的模式
+3. **抽取前读取 DOM**：在刷新前读取历史，避免页面刷新导致内容丢失
 
 ---
 
@@ -149,93 +294,18 @@ async def send_message(text: str):
 
 ```python
 async def read_response():
-    """读取 Gemini 的回复"""
-    # 等待"继续生成"按钮出现（流式输出完毕）
-    while True:
-        await wait(3000)
-        snap = await snapshot()
-        if has_continue_button(snap):
-            await click_continue()
-        if has_response(snap):
-            break
-    return extract_text(snap, after_heading="Gemini 说")
-```
-
----
-
-## 智能路由规则
-
-### 模式路由
-```
-if any(k in msg for k in ["代码", "编程", "函数", "class ", "def "]):
-    → pro
-elif any(k in msg for k in ["分析", "为什么", "解释", "比较", "思考"]):
-    → think
-else:
-    → fast
-```
-
-### 工具路由
-```
-if any(k in msg for k in ["画", "生成图片", "image", "画图"]):
-    → image
-elif any(k in msg for k in ["深度研究", "调研", "research", "行业报告"]):
-    → deep_research
-elif any(k in msg for k in ["写代码", "编程", "code", "可视化", "交互"]):
-    → canvas
-elif any(k in msg for k in ["视频", "动画"]):
-    → video
-elif any(k in msg for k in ["音乐", "作曲"]):
-    → music
-elif any(k in msg for k in ["辅导", "教我", "学习", "作业"]):
-    → tutoring
-else:
-    → no tool
-```
-
-### 文件上传路由
-```
-if contains_github_url(msg) or any(k in msg for k in ["代码库", "仓库", "repo", "import github"]):
-    → github_import
-elif any(k in msg for k in ["上传文件", "上传文件夹", "attach"]):
-    → file_upload
-elif any(k in msg for k in ["粘贴", "复制内容"]):
-    → paste_content
-else:
-    → no upload
+    """等待生成完成，读取回复内容"""
+    await wait_for_generation()
+    await snapshot()
+    response_text = extract_response_text()
+    return response_text
 ```
 
 ---
 
 ## 文件上传：GitHub 代码库导入
 
-Gemini 支持直接导入 GitHub 仓库分析，是最可靠的上传方式。
-
-### 触发关键词
-- "分析 XX 代码库"
-- "导入 GitHub"
-- "看看这个仓库"
-- GitHub URL
-
-### 执行流程
-
-```
-1. 打开上传菜单 → 点击"导入代码"菜单项
-2. 等待"导入代码"对话框出现
-3. 在 textbox 中输入 GitHub URL
-4. 点击"导入"按钮
-5. 等待仓库链接出现（表示导入成功）
-6. 在同一输入框中输入分析请求
-7. 点击发送
-```
-
-### 关键 refs（从 snapshot 获取）
-- `上传菜单 → 导入代码(menuitem)` → 触发对话框
-- `textbox "GitHub 代码库或分支网址"` → ref=51_4（对话框内）
-- `button "导入"` → ref=51_6
-- 导入成功后出现 `link "GitHub 图标 XXX GitHub"` → 表示已挂载
-
-### 代码实现
+### 完整流程：GitHub 导入分析
 
 ```python
 async def import_github_and_analyze(github_url: str, question: str):
@@ -270,20 +340,17 @@ async def import_github_and_analyze(github_url: str, question: str):
     return await read_response()
 ```
 
-### 支持的文件上传方式对比
+### 设计改进：模式状态锁定
 
-| 方式 | 可用 | 说明 |
-|------|------|------|
-| **GitHub URL 导入** | ✅ | 最可靠，直接分析仓库代码 |
-| **上传文件夹** | ❌ | OS 原生对话框，Playwright 无法控制 |
-| **上传文件** | ❌ | OS 原生对话框，Playwright 无法控制 |
-| **粘贴内容到 textarea** | ✅ | 读取本地文件 → paste 到输入框 |
-| **Google Drive** | 未测试 | 需要 Google 账号授权 |
+针对"发起新对话重置模式"问题，采用了**先选模式，再开新对话**的设计：
 
-### 注意
-- 导入代码后，仓库文件会作为上下文附加到对话中
-- 可以连续发送多条消息，仓库上下文保持有效
-- 导入成功后可见 `link "GitHub 图标 xxx GitHub"` 元素
+```
+1. 路由判断 → 锁定模式到 session_context
+2. 发起新对话 → 清理历史，保留模式配置
+3. 在新对话中重新选择锁定的模式
+```
+
+这样无论开多少次新对话，Pro/think 模式选择都不会丢失。
 
 ---
 
