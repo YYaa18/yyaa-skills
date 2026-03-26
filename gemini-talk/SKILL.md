@@ -1,3 +1,8 @@
+---
+name: gemini-talk
+description: 与 Google Gemini 网页版对话，支持 opencli/web-access/built-in 三层降级，智能路由模式和工具，自动沉淀对话知识到本地向量知识库。
+---
+
 # gemini-talk —— 与 Google Gemini 网页版对话
 
 > 通过多种方式控制你的 Chrome Tab 中的 Gemini，智能选择传输层，自动沉淀知识到本地知识库。
