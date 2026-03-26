@@ -1,13 +1,25 @@
 # gemini-talk —— 与 Google Gemini 网页版对话
 
-> 通过 OpenClaw browser 工具直接控制你的 Chrome Tab，智能选择模式和工具，自动沉淀知识到本地知识库。
+> 通过多种方式控制你的 Chrome Tab 中的 Gemini，智能选择传输层，自动沉淀知识到本地知识库。
+
+## 传输层选择（优先级从高到低）
+
+| 方式 | 优先级 | 说明 |
+|------|--------|------|
+| **opencli** | 1️⃣ 高优 | Chrome 扩展 + 原生桥接，直连网页 Gemini，响应最快，稳定性最高，完全复用登录会话 |
+| **web-access** | 2️⃣ 中优 | CDP 直连用户 Chrome，稳定灵活，比 opencli 多一层中转 |
+| **OpenClaw 内置 browser** | 3️⃣ 兜底 | 原始方式，当 opencli/web-access 不可用时自动降级使用 |
+
+**优先策略：** 如果 `opencli` 命令存在且扩展已连接，**总是优先使用 opencli**，它效率最高。只有当 opencli 不可用时，才回退到内置 browser。
+
+---
 
 ## 核心设计：智能路由
 
-收到用户请求后，三步决策：
+收到用户请求后，四步决策：
 
 ```
-1. 判断复用/新开 → 2. 选择模式（Model） → 3. 选择工具（Tool，可选） → 4. 发送消息
+1. 选择传输层（opencli优先，内置兜底） → 2. 判断复用/新开 → 3. 选择模式（Model） → 4. 选择工具（Tool，可选） → 5. 发送消息
 ```
 
 ---
@@ -179,6 +191,30 @@ async def gemini_talk(
     force_tool: 可选 "image"|"canvas"|"deep_research"|"video"|"music"|"tutoring"
     github_url: 可选，GitHub 仓库 URL，自动导入后分析
     """
+    # 0. 传输层选择 — opencli 优先，内置兜底
+    has_opencli = await check_command_exists("opencli")
+    opencli_connected = await check_opencli_connected()
+    use_opencli = has_opencli and opencli_connected
+
+    if use_opencli:
+        # === 使用 opencli (最高效) ===
+        # 切换模式（如果需要）
+        if force_mode:
+            await opencli_switch_mode(force_mode)
+        
+        # 通过 opencli 发送消息并获取回复
+        response = await opencli_send_chat(message)
+        
+        # 保存会话上下文（知识沉淀）
+        session_context.set("gemini-talk:current_session", {
+            "transport": "opencli",
+            "history": message + "\n" + response,
+            "last_message_time": get_current_timestamp()
+        })
+        
+        return response
+    # === 降级到内置 browser ===
+
     # 0. GitHub 导入路由
     if github_url or (not force_tool and contains_github_url(message)):
         url = github_url or extract_github_url(message)
@@ -383,5 +419,6 @@ async def import_github_and_analyze(github_url: str, question: str):
 ## 前提条件
 
 - Chrome 已打开 Gemini 并登录（账号：杨洋 yangmail17@163.com）
-- 使用 `profile="user"` 连接，不需要任何扩展
-- targetId 从 `browser(action="tabs", profile="user")` 获取，通常是 "1"
+- **opencli 优先**：opencli 已安装 + Chrome 扩展 opencli Browser Bridge 已加载并连接
+  - 检测命令：`opencli doctor` 输出 "Everything looks good!" 即可
+- 如果 opencli 不可用，降级到使用 `profile="user"` 内置 browser 连接，不需要扩展

@@ -1,0 +1,6 @@
+# 知识库数据不需要提交
+data/
+__pycache__/
+*.pyc
+.opencli/
+.DS_Store
