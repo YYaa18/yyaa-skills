@@ -6,11 +6,11 @@
 
 | 方式 | 优先级 | 说明 |
 |------|--------|------|
-| **opencli** | 1️⃣ 高优 | Chrome 扩展 + 原生桥接，直连网页 Gemini，响应最快，稳定性最高，完全复用登录会话 |
-| **web-access** | 2️⃣ 中优 | CDP 直连用户 Chrome，稳定灵活，比 opencli 多一层中转 |
+| **opencli** | 1️⃣ 高优 | Chrome 扩展 + 原生桥接，直连网页 Gemini，响应最快，稳定性最高，完全复用登录会话，还支持本地文件上传 |
+| **web-access** | 2️⃣ 中优 | CDP 直连用户 Chrome，稳定灵活，支持文件上传，比 opencli 多一层中转 |
 | **OpenClaw 内置 browser** | 3️⃣ 兜底 | 原始方式，当 opencli/web-access 不可用时自动降级使用 |
 
-**优先策略：** 如果 `opencli` 命令存在且扩展已连接，**总是优先使用 opencli**，它效率最高。只有当 opencli 不可用时，才回退到内置 browser。
+**优先策略：** 如果 `opencli` 命令存在且扩展已连接，**总是优先使用 opencli**，它效率最高。如果 opencli 不可用，尝试 `web-access`，最后降级到内置 browser。
 
 ---
 
@@ -149,10 +149,11 @@ triples = kb.query_triples(subject="gemini-talk", predicate="preference")
 
 | 方式 | 可用 | 说明 |
 |------|------|------|
+| **opencli 直接上传本地文件** | ✅ | opencli 通过 setFiles API 绕过 OS 对话框，直接上传本地任意文件 |
 | **GitHub URL 导入** | ✅ | 最可靠，直接分析仓库代码 |
-| **上传文件夹** | ❌ | OS 原生对话框，Playwright 无法控制 |
-| **上传文件** | ❌ | OS 原生对话框，Playwright 无法控制 |
-| **粘贴内容到 textarea** | ✅ | 读取本地文件 → paste 到输入框 |
+| **粘贴内容到 textarea** | ✅ | 读取本地小文件内容 → Markdown 包裹 → 发送，比导入更快捷 |
+| **上传文件夹** | ❌ | OS 原生对话框，自动化工具无法控制 |
+| **上传文件（内置 browser）** | ❌ | OS 原生对话框，Playwright 无法控制 |
 | **Google Drive** | 未测试 | 需要 Google 账号授权 |
 
 ### 注意
@@ -191,16 +192,22 @@ async def gemini_talk(
     force_tool: 可选 "image"|"canvas"|"deep_research"|"video"|"music"|"tutoring"
     github_url: 可选，GitHub 仓库 URL，自动导入后分析
     """
-    # 0. 传输层选择 — opencli 优先，内置兜底
+    # 0. 传输层选择 — opencli 优先，web-access 次之，内置兜底
     has_opencli = await check_command_exists("opencli")
     opencli_connected = await check_opencli_connected()
-    use_opencli = has_opencli and opencli_connected
-
-    if use_opencli:
-        # === 使用 opencli (最高效) ===
+    has_web_access = await check_module_exists("web_access")
+    
+    if has_opencli and opencli_connected:
+        # === 1️⃣ 使用 opencli (最高效) ===
         # 切换模式（如果需要）
         if force_mode:
-            await opencli_switch_mode(force_mode)
+            result = await opencli_switch_mode(force_mode)
+            if not result.success:
+                # 切换失败两次则强制刷新自愈
+                if retry_count >= 2:
+                    await page_reload()
+                    await wait_for_load()
+                await select_mode(force_mode)
         
         # 通过 opencli 发送消息并获取回复
         response = await opencli_send_chat(message)
@@ -213,7 +220,10 @@ async def gemini_talk(
         })
         
         return response
-    # === 降级到内置 browser ===
+    elif has_web_access:
+        # === 2️⃣ 使用 web-access (CDP 直连，次高效) ===
+        return await web_access_gemini_chat(message, force_mode, force_tool, github_url)
+    # === 3️⃣ 降级到内置 browser ===
 
     # 0. GitHub 导入路由
     if github_url or (not force_tool and contains_github_url(message)):
@@ -230,8 +240,9 @@ async def gemini_talk(
     
     # 如果需要新开，先抽取旧会话知识到知识库
     if is_new_topic and last_session:
-        # 在发起新对话前读取 DOM 历史，避免刷新后丢失
+        # 在发起新对话前读取 DOM 历史，存入临时暂存区防止丢失
         full_history = get_current_history_from_dom()
+        await save_to_temp_storage(full_history)
         async_extract_to_knowledge_base(full_history, llm_extract=True)
         # 只清除对话历史，保留模式配置
         session_context.clear(keep_keys=["gemini-talk:locked_mode"])
@@ -254,7 +265,12 @@ async def gemini_talk(
         # 所以必须在这里重新检测并切换
         current_mode_in_page = get_current_mode_from_page()
         if current_mode_in_page != mode:
-            await select_mode(mode)
+            # 失败重试，两次失败则强制刷新自愈
+            success = await select_mode(mode)
+            if not success:
+                await page_reload()
+                await wait_for_load()
+                await select_mode(mode)
     
     # 3. 工具路由（默认无工具）
     tool = force_tool or route_tool(message)
@@ -291,6 +307,8 @@ def get_current_mode_from_page() -> str:
     Gemini UI 设计：左上角按钮文字 = "你可以点击我切换到这个模式"
     → 如果按钮显示 "PRO"，说明当前不是 PRO，点击才会切换
     → 如果按钮显示 "快速"，说明当前已经是 PRO
+    
+    特征锚点（兼容 UI 更新）：按钮具有 aria-haspopup="menu" 属性
     """
     if page_has_button("快速"):
         return "pro"
@@ -300,8 +318,14 @@ def get_current_mode_from_page() -> str:
         return "fast"
 
 async def select_mode(mode: str):
-    """点击模式选择器，然后选对应模式"""
-    await click("打开模式选择器")      # ref=1_23
+    """点击模式选择器，然后选对应模式
+    特征锚点：打开模式选择器按钮具有 aria-haspopup="menu"
+    """
+    # 双重定位：先按 ref，找不到再按特征锚点
+    if page_has_element("ref=1_23"):
+        await click("打开模式选择器")      # ref=1_23
+    else:
+        await click("button[aria-haspopup='menu']") # 特征锚点，兼容 UI 更新
     await wait_for_menu()
     if mode == "think":
         await click("思考 解决复杂问题") # ref=33_2
@@ -314,8 +338,14 @@ async def select_mode(mode: str):
 
 ```python
 async def select_tool(tool: str):
-    """点击工具按钮，然后选对应工具"""
-    await click("工具")  # ref=1_22
+    """点击工具按钮，然后选对应工具
+    特征锚点：工具按钮具有 aria-haspopup="menu"
+    """
+    # 双重定位：先按 ref，找不到再按特征锚点兼容 UI 更新
+    if page_has_element("ref=1_22"):
+        await click("工具")  # ref=1_22
+    else:
+        await click("button[aria-haspopup='menu']:has-text('工具')")
     await wait_for_menu()
     tool_map = {
         "image": "制作图片",
@@ -372,9 +402,11 @@ async def import_github_and_analyze(github_url: str, question: str):
     await click("导入")               # 按钮
 
     # Step 3: 等待导入成功（出现 GitHub link）
+    # 动态超时：仓库越大，等待时间越长，默认 60 秒
+    const timeout = github_url.length > 30 ? 60000 : 30000;
     await wait_for_condition(
         lambda snap: find_github_link(snap) is not None,
-        timeout=15000
+        timeout: timeout
     )
 
     # Step 4: 在 textarea 中输入分析请求
@@ -408,10 +440,13 @@ async def import_github_and_analyze(github_url: str, question: str):
 
 | 情况 | 处理 |
 |------|------|
+| opencli 检测失败 | 自动降级到 web-access，再失败降级到内置 browser，同时提示用户检查 `opencli doctor` |
 | 找不到 textarea | 刷新页面重试（用户可能关了 Gemini） |
 | 发送按钮 ref 找不到 | 重新 snapshot |
+| 模式切换连续失败 2 次 | 强制刷新页面，然后重试（Gemini React 状态偶尔会死锁） |
 | 超时（90秒无回复） | 返回"生成超时，请重试" |
 | 工具选择后页面跳转 | 等待新页面加载完成再填消息 |
+| GitHub 导入超时 | 动态调整超时，大仓库允许 60 秒 |
 | 未登录 | 提示用户先登录 Google 账号 |
 
 ---
